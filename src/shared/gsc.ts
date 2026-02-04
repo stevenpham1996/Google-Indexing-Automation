@@ -54,7 +54,7 @@ export function convertToHTTPS(domain: string) {
 /**
  * Retrieves a list of sites associated with the specified service account from the Google Webmasters API.
  * @param accessToken - The access token for authentication.
- * @returns An array containing the site URLs associated with the service account.
+ * @returns An array containing the site URLs and permission levels associated with the service account.
  */
 export async function getSites(accessToken: string) {
   const sitesResponse = await fetchRetry("https://www.googleapis.com/webmasters/v3/sites", {
@@ -76,14 +76,14 @@ export async function getSites(accessToken: string) {
     return [];
   }
 
-  return sitesBody.siteEntry.map((x) => x.siteUrl);
+  return sitesBody.siteEntry.map((x) => ({ siteUrl: x.siteUrl!, permissionLevel: x.permissionLevel! }));
 }
 
 /**
  * Checks if the site URL is valid and accessible by the service account.
  * @param accessToken - The access token for authentication.
  * @param siteUrl - The URL of the site to check.
- * @returns The corrected URL if found, otherwise the original site URL.
+ * @returns The corrected URL if found, otherwise throws an error.
  */
 export async function checkSiteUrl(accessToken: string, siteUrl: string) {
   const sites = await getSites(accessToken);
@@ -108,17 +108,19 @@ export async function checkSiteUrl(accessToken: string, siteUrl: string) {
     process.exit(1);
   }
 
-  // Check if any of the formatted URLs are accessible
+  // Check if any of the formatted URLs are accessible and have 'siteOwner' permission
   for (const formattedUrl of formattedUrls) {
-    if (sites.includes(formattedUrl)) {
+    const site = sites.find((s) => s.siteUrl === formattedUrl);
+    if (site) {
+      if (site.permissionLevel !== "siteOwner") {
+        throw new Error(`Service account has '${site.permissionLevel}' permission, but 'siteOwner' is required.`);
+      }
       return formattedUrl;
     }
   }
 
   // If none of the formatted URLs are accessible
-  console.error("❌ This service account doesn't have access to this site.");
-  console.error("");
-  process.exit(1);
+  throw new Error("This service account doesn't have access to this site.");
 }
 
 /**
@@ -286,6 +288,7 @@ export async function getPublishMetadata(accessToken: string, url: string, optio
  * Requests indexing for the given URL.
  * @param accessToken - The access token for authentication.
  * @param url - The URL to be indexed.
+ * @returns The status of the request.
  */
 export async function requestIndexing(accessToken: string, url: string) {
   const response = await fetchRetry("https://indexing.googleapis.com/v3/urlNotifications:publish", {
@@ -319,4 +322,6 @@ export async function requestIndexing(accessToken: string, url: string) {
       console.error(await response.text());
     }
   }
+
+  return response.status;
 }

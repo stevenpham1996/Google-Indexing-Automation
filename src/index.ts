@@ -1,4 +1,4 @@
-import { getAccessToken } from "./shared/auth";
+import { getAccessToken, getServiceAccountCredentials, ServiceAccount } from "./shared/auth";
 import {
   convertToSiteUrl,
   getPublishMetadata,
@@ -63,23 +63,43 @@ export const index = async (input: string = process.argv[2], options: IndexOptio
     };
   }
 
-  const accessToken = await getAccessToken(options.client_email, options.private_key, options.path);
+  let credentials: ServiceAccount[] = [];
+  if (options.client_email && options.private_key) {
+    credentials = [{ client_email: options.client_email, private_key: options.private_key }];
+  } else {
+    credentials = getServiceAccountCredentials(options.path);
+  }
+
   let siteUrl = convertToSiteUrl(input);
   console.log(`🔎 Processing site: ${siteUrl}`);
   const cachePath = path.join(".cache", `${convertToFilePath(siteUrl)}.json`);
 
-  if (!accessToken) {
-    console.error("❌ Failed to get access token, check your service account credentials.");
+  let workingAccessToken: string | undefined;
+  let verifiedSiteUrl: string | undefined;
+
+  for (const credential of credentials) {
+    try {
+      const accessToken = await getAccessToken(credential.client_email, credential.private_key);
+      verifiedSiteUrl = await checkSiteUrl(accessToken, siteUrl);
+      workingAccessToken = accessToken;
+      break;
+    } catch (error) {
+      console.warn(`⚠️ Service account ${credential.client_email} failed: ${(error as Error).message}`);
+    }
+  }
+
+  if (!workingAccessToken || !verifiedSiteUrl) {
+    console.error("❌ Failed to find a service account with access to this site.");
     console.error("");
     process.exit(1);
   }
 
-  siteUrl = await checkSiteUrl(accessToken, siteUrl);
+  siteUrl = verifiedSiteUrl;
 
   let pages = options.urls || [];
   if (pages.length === 0) {
     console.log(`🔎 Fetching sitemaps and pages...`);
-    const [sitemaps, pagesFromSitemaps] = await getSitemapPages(accessToken, siteUrl);
+    const [sitemaps, pagesFromSitemaps] = await getSitemapPages(workingAccessToken, siteUrl);
 
     if (sitemaps.length === 0) {
       console.error("❌ No sitemaps found, add them to Google Search Console and try again.");
@@ -129,7 +149,18 @@ export const index = async (input: string = process.argv[2], options: IndexOptio
     async (url) => {
       let result = statusPerUrl[url];
       if (!result || shouldRecheck(result.status, result.lastCheckedAt)) {
-        const status = await getPageIndexingStatus(accessToken, siteUrl, url);
+        let status: Status = Status.Error;
+        for (const credential of credentials) {
+          try {
+            const accessToken = await getAccessToken(credential.client_email, credential.private_key);
+            status = await getPageIndexingStatus(accessToken, siteUrl, url);
+            if (status !== Status.Forbidden) {
+              break;
+            }
+          } catch (error) {
+            // continue
+          }
+        }
         result = { status, lastCheckedAt: new Date().toISOString() };
         statusPerUrl[url] = result;
       }
@@ -169,14 +200,37 @@ export const index = async (input: string = process.argv[2], options: IndexOptio
 
   for (const url of indexablePages) {
     console.log(`📄 Processing url: ${url}`);
-    const status = await getPublishMetadata(accessToken, url, {
-      retriesOnRateLimit: options.quota.rpmRetry ? QUOTA.rpm.retries : 0,
-    });
-    if (status === 404) {
-      await requestIndexing(accessToken, url);
-      console.log("🚀 Indexing requested successfully. It may take a few days for Google to process it.");
-    } else if (status < 400) {
-      console.log(`🕛 Indexing already requested previously. It may take a few days for Google to process it.`);
+
+    let processed = false;
+    for (const credential of credentials) {
+      try {
+        const accessToken = await getAccessToken(credential.client_email, credential.private_key);
+        const status = await getPublishMetadata(accessToken, url, {
+          retriesOnRateLimit: options.quota.rpmRetry ? QUOTA.rpm.retries : 0,
+        });
+
+        if (status === 403) {
+          continue;
+        }
+
+        if (status === 404) {
+          const requestStatus = await requestIndexing(accessToken, url);
+          if (requestStatus === 403) {
+            continue;
+          }
+          console.log("🚀 Indexing requested successfully. It may take a few days for Google to process it.");
+        } else if (status < 400) {
+          console.log(`🕛 Indexing already requested previously. It may take a few days for Google to process it.`);
+        }
+        processed = true;
+        break;
+      } catch (error) {
+        // continue
+      }
+    }
+
+    if (!processed) {
+      console.error(`❌ Failed to process URL ${url} with any of the provided service accounts.`);
     }
     console.log(``);
   }
