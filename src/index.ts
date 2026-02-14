@@ -74,32 +74,43 @@ export const index = async (input: string = process.argv[2], options: IndexOptio
   console.log(`🔎 Processing site: ${siteUrl}`);
   const cachePath = path.join(".cache", `${convertToFilePath(siteUrl)}.json`);
 
-  let workingAccessToken: string | undefined;
+  const validCredentials: { credential: ServiceAccount; accessToken: string }[] = [];
   let verifiedSiteUrl: string | undefined;
 
   for (const credential of credentials) {
     try {
       const accessToken = await getAccessToken(credential.client_email, credential.private_key);
-      verifiedSiteUrl = await checkSiteUrl(accessToken, siteUrl);
-      workingAccessToken = accessToken;
-      break;
+      const url = await checkSiteUrl(accessToken, siteUrl);
+      if (!verifiedSiteUrl) {
+        verifiedSiteUrl = url;
+      }
+      validCredentials.push({ credential, accessToken });
     } catch (error) {
       console.warn(`⚠️ Service account ${credential.client_email} failed: ${(error as Error).message}`);
     }
   }
 
-  if (!workingAccessToken || !verifiedSiteUrl) {
-    console.error("❌ Failed to find a service account with access to this site.");
+  if (validCredentials.length === 0 || !verifiedSiteUrl) {
+    console.error("❌ Failed to find any service account with access to this site.");
     console.error("");
     process.exit(1);
   }
 
   siteUrl = verifiedSiteUrl;
+  let currentAccountIndex = 0;
+
+  const rotateAccount = async () => {
+    currentAccountIndex = (currentAccountIndex + 1) % validCredentials.length;
+    const next = validCredentials[currentAccountIndex];
+    console.log(`🔄 Rotating to service account: ${next.credential.client_email}`);
+    next.accessToken = await getAccessToken(next.credential.client_email, next.credential.private_key);
+    return next.accessToken;
+  };
 
   let pages = options.urls || [];
   if (pages.length === 0) {
     console.log(`🔎 Fetching sitemaps and pages...`);
-    const [sitemaps, pagesFromSitemaps] = await getSitemapPages(workingAccessToken, siteUrl);
+    const [sitemaps, pagesFromSitemaps] = await getSitemapPages(validCredentials[currentAccountIndex].accessToken, siteUrl);
 
     if (sitemaps.length === 0) {
       console.error("❌ No sitemaps found, add them to Google Search Console and try again.");
@@ -150,17 +161,26 @@ export const index = async (input: string = process.argv[2], options: IndexOptio
       let result = statusPerUrl[url];
       if (!result || shouldRecheck(result.status, result.lastCheckedAt)) {
         let status: Status = Status.Error;
-        for (const credential of credentials) {
-          try {
-            const accessToken = await getAccessToken(credential.client_email, credential.private_key);
-            status = await getPageIndexingStatus(accessToken, siteUrl, url);
-            if (status !== Status.Forbidden) {
-              break;
-            }
-          } catch (error) {
-            // continue
+        let rotationCount = 0;
+
+        while (rotationCount < validCredentials.length) {
+          status = await getPageIndexingStatus(validCredentials[currentAccountIndex].accessToken, siteUrl, url);
+
+          if (status === Status.RateLimited) {
+            await rotateAccount();
+            rotationCount++;
+            continue;
           }
+
+          if (status === Status.Forbidden) {
+            await rotateAccount();
+            rotationCount++;
+            continue;
+          }
+
+          break;
         }
+
         result = { status, lastCheckedAt: new Date().toISOString() };
         statusPerUrl[url] = result;
       }
@@ -202,31 +222,33 @@ export const index = async (input: string = process.argv[2], options: IndexOptio
     console.log(`📄 Processing url: ${url}`);
 
     let processed = false;
-    for (const credential of credentials) {
-      try {
-        const accessToken = await getAccessToken(credential.client_email, credential.private_key);
-        const status = await getPublishMetadata(accessToken, url, {
-          retriesOnRateLimit: options.quota.rpmRetry ? QUOTA.rpm.retries : 0,
-        });
+    let rotationCount = 0;
 
-        if (status === 403) {
+    while (rotationCount < validCredentials.length) {
+      const { accessToken } = validCredentials[currentAccountIndex];
+      const status = await getPublishMetadata(accessToken, url, {
+        retriesOnRateLimit: options.quota.rpmRetry ? QUOTA.rpm.retries : 0,
+      });
+
+      if (status === 429 || status === 403) {
+        await rotateAccount();
+        rotationCount++;
+        continue;
+      }
+
+      if (status === 404) {
+        const requestStatus = await requestIndexing(accessToken, url);
+        if (requestStatus === 429 || requestStatus === 403) {
+          await rotateAccount();
+          rotationCount++;
           continue;
         }
-
-        if (status === 404) {
-          const requestStatus = await requestIndexing(accessToken, url);
-          if (requestStatus === 403) {
-            continue;
-          }
-          console.log("🚀 Indexing requested successfully. It may take a few days for Google to process it.");
-        } else if (status < 400) {
-          console.log(`🕛 Indexing already requested previously. It may take a few days for Google to process it.`);
-        }
-        processed = true;
-        break;
-      } catch (error) {
-        // continue
+        console.log("🚀 Indexing requested successfully. It may take a few days for Google to process it.");
+      } else if (status < 400) {
+        console.log(`🕛 Indexing already requested previously. It may take a few days for Google to process it.`);
       }
+      processed = true;
+      break;
     }
 
     if (!processed) {

@@ -271,7 +271,7 @@ export async function getPublishMetadata(accessToken: string, url: string, optio
       console.error("   Quota: https://developers.google.com/search/apis/indexing-api/v3/quota-pricing#quota");
       console.error("   Usage: https://console.cloud.google.com/apis/enabled");
       console.error("");
-      process.exit(1);
+      return response.status;
     }
   }
 
@@ -315,7 +315,7 @@ export async function requestIndexing(accessToken: string, url: string) {
       console.error("   Quota: https://developers.google.com/search/apis/indexing-api/v3/quota-pricing#quota");
       console.error("   Usage: https://console.cloud.google.com/apis/enabled");
       console.error("");
-      process.exit(1);
+      return response.status;
     } else {
       console.error(`❌ Failed to request indexing.`);
       console.error(`Response was: ${response.status}`);
